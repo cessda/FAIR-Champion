@@ -2,6 +2,152 @@
 
 All notable changes to FAIR Champion are documented here.
 
+## [1.1.22] - 2026-09-11
+
+### Added
+- Algorithm test-weight spreadsheets can now define an `Error Weight` column
+  alongside `Pass Weight`, `Fail Weight`, and `Indeterminate Weight`, applied
+  when a test result's status is `error`. Legacy spreadsheets without the
+  column default to a weight of `0.0`.
+- `POST /champion/assess/algorithm/*` now returns HTTP `207 Multi-Status`
+  (instead of `200 OK`, for both HTML and JSON responses) whenever the
+  returned `TestResultSet` contains one or more `error` `TestResult`s, so
+  clients can detect an incomplete report without inspecting the body.
+
+### Fixed
+- `Algorithm#parse_single_test_response` no longer takes an unused
+  `resultset:` parameter — it only ever queried the `@resultsetgraph`
+  instance variable, not the argument.
+- `Champion::Core#run_test` no longer takes an unused `testid:` parameter,
+  and dropped a pointless `testurl = testapi` local-variable alias.
+
+## [1.1.21] - 2026-09-04
+
+### Fixed
+- CI was failing intermittently on `GET /champion/algorithms/:algorithmid`'s
+  Turtle response: `@dcat.dump(:turtle)` in `app/controllers/routes.rb` let
+  `RDF::Writer.for(:turtle)` resolve to `rdf-raptor`'s FFI-based writer,
+  which needs the system library `libraptor2` — present on this
+  developer's machine but not guaranteed on GitHub Actions' `ubuntu-latest`
+  runner, and not installed by the CI workflow. Both `.dump(:turtle)` call
+  sites now pass `writer: RDF::Turtle::Writer` explicitly, pinning
+  Turtle serialization to the pure-Ruby `rdf-turtle` gem so it no longer
+  depends on `libraptor2` being present at all. Also added a
+  `libraptor2-0` apt-get step to `.github/workflows/ci.yml` as a
+  belt-and-suspenders fix, since `rdf-raptor` is still a direct
+  dependency used elsewhere.
+
+## [1.1.20] - 2026-09-03
+
+### Changed
+- Each test's name in the algorithm execution report's test results table
+  is now a hyperlink to its associated FAIR Metric (the `sio:SIO_000233`
+  / "implementation of" value already fetched by `get_tests`, now stored
+  as `metric_url` on each `@tests` entry in `lib/algorithm.rb` and
+  rendered in `app/views/_test_results.erb`). Falls back to plain text
+  when the registry has no metric URL recorded for a test.
+
+## [1.1.19] - 2026-09-03
+
+### Fixed
+- **Critical**: every Champion Algorithm execution was failing all of its
+  tests. `Champion::Core#test_thread` (`lib/champion_core.rb:253`) rejected
+  any result Hash lacking a top-level `@type` key, treating it as
+  "unexpected" and replacing it with a synthesized error — but real test
+  output (and our own `error_result` helper, both built via
+  `FtrRuby::Output#createEvaluationResponse`) always serializes as a
+  multi-subject JSON-LD graph, which puts the subjects under a top-level
+  `@graph` array instead of a flat `@type`. That shape has therefore never
+  matched the check since `error_result` started using the same builder
+  (1.1.17), meaning every real, passing test result was being silently
+  discarded and reported as an error. Verified against a live test
+  endpoint (`tests.ostrails.eu/tests/assess/test/fc_metadata_identifier_persistence`)
+  before and after the fix. The check now also accepts a result carrying
+  `@graph`; only a response with neither `@type` nor `@graph` (the genuine
+  network-error fallback shape) is still treated as unexpected. Added
+  regression tests in `spec/champion__core_spec.rb` covering both a
+  real graph-wrapped success result and a genuinely malformed response.
+
+## [1.1.18] - 2026-09-03
+
+### Changed
+- The algorithm execution report is more informative: the test results
+  table now shows each test's registered title (looked up from the FDP
+  index via `Champion::Core#get_tests`) alongside its testid, instead of
+  just the opaque short CSV reference code (e.g. `T1`). The conclusions
+  table now labels each row with the condition's actual description and
+  formula (already computed in `Algorithm#load_configuration` but never
+  passed to the view) instead of a bare "Condition 1", "Condition 2" index.
+- `Algorithm#gather_metadata` now calls `Champion::Core#get_tests` (which
+  returns title, description, and endpoint in one SPARQL round trip)
+  instead of the narrower `get_test_endpoint_for_testid`, storing the
+  title on each test entry for the report to use.
+
+## [1.1.17] - 2026-08-24
+
+### Changed
+- `Champion::Core#test_thread` no longer hand-builds error-result hashes
+  when a test thread crashes or a test service returns something unusable.
+  It now uses `FtrRuby::Output` — the same canonical builder real test
+  services use to construct their output — via a new `error_result` helper,
+  setting `score = "error"` and logging the failure message. This fixes a
+  real inconsistency: the old hand-built hashes used a `'status'` key,
+  which nothing downstream reads, while `Algorithm#parse_single_test_response`
+  looks for `prov:value` to determine pass/fail/error — so synthesized
+  error results were previously invisible to algorithm scoring and showed
+  up as "indeterminate (result data not found)" instead of "error". The
+  new results carry `prov:value = "error"` like real test output, and their
+  `@id` is generated by `FtrRuby::Output` itself rather than by Champion
+  code. `ftr:outputFromTest` is reconstructed to match `idpair[:testid]`
+  exactly (required for the SPARQL matching in `parse_single_test_response`
+  to find them at all).
+- Added the `ftr_ruby` gem dependency (`~> 0.1.15`), which required
+  loosening two existing Gemfile pins it conflicts with: `rdf-raptor`
+  (`~> 3.1.0` → `~> 3.2.0`) and `json` (`~> 2.6.3` → `~> 2.7`). Full spec
+  suite passes under the new versions (25 examples, 0 failures); the
+  `rdf-raptor` bump does introduce a harmless FFI finalizer warning at
+  process exit (`wrong number of arguments (1 for 0)` in
+  `raptor_free_world`) that does not affect test results or exit status.
+
+## [1.1.16] - 2026-08-20
+
+### Added
+- The algorithm list page (`/champion/algorithms/`) now has the same
+  keyword-filter search box as the test list page: a GET form filtering
+  results (case-insensitive) by title/description, matching the pattern
+  already used for `/champion/tests/`.
+
+## [1.1.15] - 2026-08-20
+
+### Fixed
+- `Algorithm.list`'s SPARQL query grouped results by seven fields
+  (`?identifier ?title ?description ?endpoint ?openapi ?benchmark
+  ?calculation_uri`) instead of by identifier alone. Re-registering an
+  already-registered algorithm creates a second resource in the FDP Index
+  for the same `dct:identifier` (a duplicate-insert issue in the external
+  FDP Index service itself, outside this repo); if that second copy's
+  `calculation_uri`/title/description differ from the first by so much as
+  trailing whitespace, the old query's multi-field GROUP BY treated them as
+  distinct groups and listed the same algorithm twice. `Algorithm.list` now
+  groups by `?identifier` only, using `SAMPLE()` for the other scalar
+  fields and `GROUP_CONCAT(DISTINCT ...)` for the multi-valued
+  objects/domains, so duplicate underlying records collapse into one row —
+  matching how the FDP Index's own UI already displays results.
+
+## [1.1.14] - 2026-08-20
+
+### Fixed
+- The GUI's "register new algorithm" POST handler built its post-registration
+  redirect by taking the `path` component of `Algorithm#algorithm_guid` —
+  which lives in the `w3id.org/FAIR-Champion` namespace — and resolving it
+  against the current request's host. That sent users to
+  `https://tools.ostrails.eu/FAIR-Champion/algorithms/.../display`, a URL
+  that doesn't exist on the app (which is actually mounted at
+  `/champion/...`), instead of the intended
+  `https://tools.ostrails.eu/champion/algorithms/.../display`. The redirect
+  is now built directly from `algorithm.algorithm_id` against the app's own
+  `/champion/algorithms/` path, matching the route it's supposed to hit.
+
 ## [1.1.13] - 2026-08-06
 
 ### Changed
