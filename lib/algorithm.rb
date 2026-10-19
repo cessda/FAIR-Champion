@@ -198,7 +198,8 @@ class Algorithm
       testedguid: testedguid,
       guidances: guidances,
       tests: tests,
-      conditions: @conditions # weird that RuboCop doesn't like this variable name as a attr_accessor
+      conditions: @conditions, # weird that RuboCop doesn't like this variable name as a attr_accessor
+      has_errors: test_results.each_value.any? { |result| result[:result] == 'error' }
     }
   end
 
@@ -263,16 +264,22 @@ class Algorithm
     c = Champion::Core.new # needed for registry lookup
     @tests = csv_data.map do |row|
       testid = row['Test GUID'].to_s.strip
-      endpoint = c.get_test_endpoint_for_testid(testid: testid)
+      registry_test = c.get_tests(testid: testid).first
+      endpoint = registry_test&.endpoint
+      title = registry_test&.title
+      metric_url = registry_test&.benchmark_or_metric
       warn "No endpoint found for test #{testid}; the FDP index has no current record for it — the algorithm will still be registered, but this test's endpoint is unresolved" if endpoint.nil?
       {
         reference: row['Test Reference'].to_s.strip,
         name: testid,
         testid: testid,
+        title: title,
+        metric_url: metric_url,
         endpoint: endpoint,
         pass_weight: row['Pass Weight'].to_f,
         fail_weight: row['Fail Weight'].to_f,
-        indeterminate_weight: row['Indeterminate Weight'].to_f
+        indeterminate_weight: row['Indeterminate Weight'].to_f,
+        error_weight: row['Error Weight'].to_f # legacy sheets lack this column; nil.to_f defaults to 0.0
       }
     end
     warn "TESTS:  #{@tests.inspect}"
@@ -465,7 +472,8 @@ class Algorithm
     #   endpoint: c.get_test_endpoint_for_testid(testid: row['Test GUID']),
     #   pass_weight: row['Pass Weight'].to_f,
     #   fail_weight: row['Fail Weight'].to_f,
-    #   indeterminate_weight: row['Indeterminate Weight'].to_f
+    #   indeterminate_weight: row['Indeterminate Weight'].to_f,
+    #   error_weight: row['Error Weight'].to_f
     # }
     # get the endpoints for the tests
     endpoints = @tests.map { |test| { testid: test[:testid], endpoint: test[:endpoint] } }
@@ -487,7 +495,7 @@ class Algorithm
 
     results = {}
     @tests.each do |test| # the tests defined in the algorithm
-      passfail, log = parse_single_test_response(resultset: @resultset, testid: test[:name]) # extract result for THAT test from the restul-set
+      passfail, log = parse_single_test_response(testid: test[:name]) # extract result for THAT test from the restul-set
       results[test[:reference]] = if passfail # if there's a value, then the test existed
                                     {
                                       log: log,
@@ -496,6 +504,7 @@ class Algorithm
                                               when 'pass' then test[:pass_weight]
                                               when 'fail' then test[:fail_weight]
                                               when 'indeterminate' then test[:indeterminate_weight]
+                                              when 'error' then test[:error_weight]
                                               else 0.0
                                               end
                                     }
@@ -510,7 +519,7 @@ class Algorithm
     results
   end
 
-  def parse_single_test_response(resultset:, testid:)
+  def parse_single_test_response(testid:)
     # warn 'GRAPH:', graph.dump(:turtle), "\n\n"
     # <urn:fairtestoutput:2152d30f-516c-43da-b647-4f4726c33fbb> a <https://w3id.org/ftr#TestResult>;
     #   ftr:outputFromTest <https://tests.ostrails.eu/tests/fc_metadata_includes_license> ;  # mandatory
@@ -633,7 +642,8 @@ class Algorithm
         #   endpoint: get_test_endpoint_for_testid(testid: row['Test GUID']),
         #   pass_weight: row['Pass Weight'].to_f,
         #   fail_weight: row['Fail Weight'].to_f,
-        #   indeterminate_weight: row['Indeterminate Weight'].to_f
+        #   indeterminate_weight: row['Indeterminate Weight'].to_f,
+        #   error_weight: row['Error Weight'].to_f
         # }
         result = test_results[test[:reference]]
         variables.merge!(test[:reference] => result[:weight].to_s) # e.g. "T1" => 10
@@ -719,7 +729,10 @@ class Algorithm
       PREFIX sio: <http://semanticscience.org/resource/>
       PREFIX dpv: <http://www.w3.org/ns/dpv#>
       PREFIX ftr: <https://w3id.org/ftr#>
-      SELECT ?identifier ?title ?description ?endpoint ?calculation_uri ?openapi (GROUP_CONCAT(?objects; separator=", ") AS ?objects) (GROUP_CONCAT(?domain; separator=", ") AS ?domains) ?benchmark
+      SELECT ?identifier (SAMPLE(?title) AS ?title) (SAMPLE(?description) AS ?description)
+             (SAMPLE(?endpoint) AS ?endpoint) (SAMPLE(?calculation_uri) AS ?calculation_uri)
+             (SAMPLE(?openapi) AS ?openapi) (GROUP_CONCAT(DISTINCT ?objects; separator=", ") AS ?objects)
+             (GROUP_CONCAT(DISTINCT ?domain; separator=", ") AS ?domains) (SAMPLE(?benchmark) AS ?benchmark)
       WHERE {
         ?subject a <https://w3id.org/ftr#ScoringAlgorithm> ;
             dct:title ?title ;
@@ -732,7 +745,7 @@ class Algorithm
         OPTIONAL { ?subject sio:SIO_000233 ?benchmark }
         OPTIONAL { ?subject ftr:scoringFunction ?calculation_uri}
       }
-      GROUP BY ?identifier ?title ?description ?endpoint ?openapi ?benchmark ?calculation_uri
+      GROUP BY ?identifier
 EOQ
 
     results = client.query(algossquery)

@@ -7,6 +7,7 @@ require 'linkeddata'
 require 'safe_yaml'
 require 'rdf/nquads'
 require 'uri'
+require 'ftr_ruby'
 
 # The Champion module provides core functionality for executing assessments and tests
 # against digital objects using RDF, SPARQL, and external APIs.
@@ -194,6 +195,9 @@ module Champion
       # Split the algorithm's tests into one list per destination host —
       # e.g. all the tests.ostrails.eu tests end up in one group, all the
       # w3id.org ones in another, etc.
+      # This is done to try to be polite to the test hosts: we want to run tests in 
+      # parallel, but not so many that we saturate any one host. So we run all the hosts in parallel, 
+      # but within each host we run only a limited number of tests at once (PER_HOST_TEST_CONCURRENCY). 
       grouped = endpoints.group_by { |idpair| endpoint_host(idpair[:endpoint]) }
 
       # Two levels of threading here, on purpose:
@@ -241,21 +245,55 @@ module Champion
     def test_thread(subject:, idpair:, mutex:, results:)
       Thread.new do
         begin
-          result = run_test(guid: subject, testapi: idpair[:endpoint], testid: idpair[:testid])
+          result = run_test(guid: subject, testapi: idpair[:endpoint])
         rescue StandardError => e
           warn "Thread for #{idpair[:testid]} failed unexpectedly: #{e.message}"
-          result = {
-            '@type'          => 'ftr:TestResult',
-            '@id'            => "urn:fairchampion:thread-error:#{SecureRandom.uuid}",
-            'status'         => 'indeterminate',
-            'log'            => "Test execution thread failed: #{e.message}",
-            'outputFromTest' => idpair[:testid]
-          }
+          result = error_result(subject: subject, idpair: idpair, message: "Test execution thread failed: #{e.message}")
+        end
+        if result.is_a?(Hash) && !result.key?('@type') && !result.key?('@graph')
+          warn "Test #{idpair[:testid]} returned unexpected result: #{result.inspect}"
+          result = error_result(subject: subject, idpair: idpair, message: "Test returned unexpected result: #{result.inspect}")
         end
         mutex.synchronize { results << result }
       end
     end
     private :test_thread
+
+    # Builds a synthesized error result using the canonical FtrRuby::Output
+    # builder, so failures are represented identically to real test output
+    # (same predicates, same shape) rather than hand-rolled hashes.
+    # FtrRuby::Output assigns the TestResult's @id itself.
+    #
+    # FtrRuby::Output rebuilds ftr:outputFromTest from meta[:protocol] +
+    # meta[:host] + meta[:basePath] + meta[:testid] rather than taking a
+    # ready-made URI, so idpair[:testid] (the exact string parse_single_test_response
+    # in Algorithm matches ftr:outputFromTest against) is passed as protocol/host/basePath
+    # together with an empty local testid — the munging in FtrRuby::Output's
+    # initializer then reassembles it byte-for-byte instead of appending a
+    # second copy of it.
+    #
+    # @return [Hash] a parsed JSON-LD ftr:TestResult document
+    def error_result(subject:, idpair:, message:)
+      testid = idpair[:testid].to_s
+      testid = 'urn:fairchampion:unknown-test' if testid.strip.empty?
+
+      output = FtrRuby::Output.new(
+        testedGUID: subject,
+        meta: {
+          testname: testid,
+          description: 'Test execution error',
+          metric: testid,
+          testversion: 'n/a',
+          protocol: testid,
+          host: testid,
+          basePath: testid
+        }
+      )
+      output.score = 'error'
+      output.comments << message
+      JSON.parse(output.createEvaluationResponse)
+    end
+    private :error_result
 
     #  THIS IS CALLED BY ALGORITHM via CORE!
     #  THIS IS CALLED BY ALGORITHM!
@@ -263,7 +301,6 @@ module Champion
     #  THIS IS CALLED BY ALGORITHM!
     #  THIS IS CALLED BY ALGORITHM!
     # Runs a single test against a test API endpoint.
-    # Note: The test API URL is derived from the testapi parameter, which is temporarily munged to extract the test name.
     #
     # @param testapi [String] The API endpoint for the test.
     # @param guid [String] The GUID of the digital object to assess.
@@ -273,11 +310,10 @@ module Champion
     #   core = Champion::Core.new
     #   result = core.run_test(testapi: 'https://tests.ostrails.eu/tests/test1/api', guid: 'https://example.org/target/456')
     #   puts result
-    def run_test(testapi:, guid:, testid:)
-      testurl = testapi
+    def run_test(testapi:, guid:)
       begin
         result = RestClient::Request.execute(
-          url: testurl,
+          url: testapi,
           method: :post,
           payload: { 'resource_identifier' => guid }.to_json,
           headers: {
@@ -288,11 +324,11 @@ module Champion
       rescue RestClient::ExceptionWithResponse => e
         warn "Test Execution failed with status: #{e.response.code}"
         warn "Error details: #{e.response.body}"
-        return JSON.parse({ error: "#{testurl} did not respond happily.  Are you sure the test is registered? #{e.message}" }.to_json)
+        return JSON.parse({ error: "#{testapi} did not respond happily.  Are you sure the test is registered? #{e.message}" }.to_json)
       rescue StandardError => e
         warn "Test Execution Unexpected error: #{e.message}"
-        warn "#{testurl} did not respond happily"
-        return JSON.parse({ error: "#{testurl} did not respond happily. Are you sure the test is registered? #{e.message}" }.to_json)
+        warn "#{testapi} did not respond happily"
+        return JSON.parse({ error: "#{testapi} did not respond happily. Are you sure the test is registered? #{e.message}" }.to_json)
       end
       body = result.body.encode('UTF-8', invalid: :replace, undef: :replace, replace: "\u{FFFD}")
       JSON.parse(body)

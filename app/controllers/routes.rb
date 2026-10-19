@@ -348,7 +348,7 @@ module Champion
 
           # No acceptable type
           error 406
-        rescue JSON::ParserError, StandardError => e
+        rescue JSON::ParserError, StandardError => e # rubocop:disable Lint/ShadowedException
           # This is where your "undefined method `value' for nil" was probably coming from
           # → safer handling now
           status 500
@@ -387,9 +387,7 @@ module Champion
         algorithm = Algorithm.new(calculation_uri: calculation_uri, guid: 'http://example.org/mock') # mock is replaced when object is finished
         algorithm.register
         sleep 10 # TODO: Replace with retry mechanism to poll FDP index for ingestion
-        algorithmpath = URI(algorithm.algorithm_guid).path
-        warn "AlgoPath is #{algorithmpath}"
-        redirect to("#{algorithmpath}/display"), 302
+        redirect to("/champion/algorithms/#{algorithm.algorithm_id}/display"), 302
       end
 
       # Displays a specific algorithm’s metadata in HTML format.
@@ -411,7 +409,16 @@ module Champion
       #   # GET /champion/algorithms/
       #   # Returns HTML list or JSON/JSON-LD data
       get %r{/champion/algorithms/?}, provides: [:html, :json, 'application/ld+json'] do
+        keyword = params['keyword'] || nil
+
         @list = Algorithm.list
+        if keyword
+          keyword = keyword.downcase
+          @list = @list.select do |data|
+            data[:title]&.downcase&.include?(keyword) ||
+              data[:description]&.downcase&.include?(keyword)
+          end
+        end
         case content_type
         when %r{application/json} || %r{application/ld+json}
           content_type :json
@@ -441,9 +448,9 @@ module Champion
         when %r{application/json} || %r{application/ld+json}
           halt @dcat.dump(:jsonld)
         when %r{text/turtle}
-          halt @dcat.dump(:turtle)
+          halt @dcat.dump(:turtle, writer: RDF::Turtle::Writer)
         end
-        halt @dcat.dump(:turtle)
+        halt @dcat.dump(:turtle, writer: RDF::Turtle::Writer)
       end
 
       # Renders a form for initiating an algorithm assessment.
@@ -574,6 +581,9 @@ module Champion
         #   conditions: conditions
         # }
         # warn "RESULT @result is #{@result.inspect} "
+        # A TestResultSet containing one or more error TestResults is incomplete;
+        # 207 lets clients detect that without inspecting the body.
+        status 207 if @result[:has_errors]
         case content_type
         when %r{text/html}
           halt erb :algorithm_execution_output, layout: :algorithm_execution_layout

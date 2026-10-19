@@ -27,8 +27,7 @@ RSpec.describe Champion::Core do
         .to_return(status: 200, body: { result: 'pass' }.to_json, headers: { 'Content-Type' => 'application/json' })
       result = core.run_test(
         testapi: 'https://tests.ostrails.eu/assess/test/fc_metadata_includes_license',
-        guid: subject,
-        testid: 'https://tests.ostrails.eu/tests/fc_metadata_includes_license'
+        guid: subject
       )
       expect(result).to eq('result' => 'pass')
     end
@@ -61,6 +60,53 @@ RSpec.describe Champion::Core do
       expect(max_in_flight['host-a.example']).to eq(3) # 5 tests, capped at 3
       expect(max_in_flight['host-b.example']).to eq(1) # only 1 test on this host
       expect(result).to be_a(String)
+    end
+
+    it 'accepts a real, graph-wrapped test result instead of flagging it as unexpected' do
+      # Real test services (and our own error_result helper) both build their
+      # response via FtrRuby::Output#createEvaluationResponse, which always
+      # produces a multi-subject RDF graph -- so JSON-LD serialization wraps
+      # it in a top-level "@graph" array rather than a flat "@type" object.
+      # Regression guard for a bug where every real/valid result was wrongly
+      # treated as "unexpected" and silently replaced with a synthesized
+      # error, because the check only recognized a flat "@type" shape.
+      real_test_output = FtrRuby::Output.new(
+        testedGUID: subject,
+        meta: {
+          testname: 'a1', description: 'A test', metric: 'a1',
+          testversion: '1.0', protocol: 'https', host: 'host-a.example', basePath: '/a1'
+        }
+      )
+      real_test_output.score = 'pass'
+      graph_wrapped_result = JSON.parse(real_test_output.createEvaluationResponse)
+      expect(graph_wrapped_result).to include('@graph') # sanity: this is the shape being regression-tested
+
+      allow(core).to receive(:run_test).and_return(graph_wrapped_result)
+
+      result = core.execute_on_endpoints(
+        subject: subject,
+        endpoints: [{ testid: 'a1', endpoint: 'https://host-a.example/1' }],
+        bmid: bmid
+      )
+
+      raw_values = JSON.parse(result)['@graph'].filter_map { |node| node['prov:value'] }
+      values = raw_values.map { |v| v.is_a?(Hash) ? v['@value'] : v }
+      expect(values).to include('pass')
+      expect(values).not_to include('error')
+    end
+
+    it 'still synthesizes an error result for a genuinely malformed response' do
+      allow(core).to receive(:run_test).and_return({ 'error' => 'did not respond happily' })
+
+      result = core.execute_on_endpoints(
+        subject: subject,
+        endpoints: [{ testid: 'a1', endpoint: 'https://host-a.example/1' }],
+        bmid: bmid
+      )
+
+      raw_values = JSON.parse(result)['@graph'].filter_map { |node| node['prov:value'] }
+      values = raw_values.map { |v| v.is_a?(Hash) ? v['@value'] : v }
+      expect(values).to include('error')
     end
   end
 end
